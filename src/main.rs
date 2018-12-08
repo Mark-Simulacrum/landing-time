@@ -68,6 +68,12 @@ impl Request<()> {
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {}", dotenv::var("APPVEYOR_OAUTH_TOKEN").unwrap()),
             )
+        } else if self.url.contains("api.travis-ci.org") {
+            client.get(&self.url)
+                .header("Travis-API-Version", "3")
+                .header(reqwest::header::AUTHORIZATION,
+                    format!("token {}", dotenv::var("TRAVIS_TOKEN").unwrap())
+                )
         } else {
             panic!("unknown API provider: {}", self.url);
         };
@@ -297,21 +303,27 @@ fn fetch_appveyor(client: &CacheClient) -> Result<(HashMap<u64, AppVeyorBuild>, 
     Ok((map, id_map))
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct TravisBuild {
+    id: u64,
+    started_at: DateTime<chrono::FixedOffset>,
+    finished_at: DateTime<chrono::FixedOffset>,
+}
+
 #[derive(Debug, Copy, Clone)]
 struct Datum {
     date: chrono::NaiveDate,
-    // in hours
     merge_delay: i64,
-    // in hours
-    // this might be None if the PR was merged via rollup
     merge_time: Option<chrono::Duration>,
     appveyor_time: Option<chrono::Duration>,
+    travis_time: Option<chrono::Duration>,
 }
 
 fn main() -> Result<()> {
     let client = Client::new();
     let gh = CacheClient::new(&client);
     let appveyor_re = regex::Regex::new(r#"\[status-appveyor\]\(.*?project/rust-lang/rust/builds?/(.+?)\)"#)?;
+    let travis_re = regex::Regex::new(r#"\[status-travis\]\(.*?builds/(\d+).*?\)"#)?;
     let prs: Vec<PullRequest> =
         gh.request_seq("https://api.github.com/repos/rust-lang/rust/pulls?state=all&per_page=100")?;
 
@@ -321,7 +333,10 @@ fn main() -> Result<()> {
 
     let mut skipped = 0;
     let mut data = Vec::new();
-    for pr in &prs[0..6000] {
+    for pr in &prs[0..8_000] {
+        if pr.created_at.date().naive_local().year() != 2018 {
+            break;
+        }
         let comments: Vec<Comment> = gh.request_seq(&pr.comments_url)?;
         let merged_at = if let Some(m) = pr.merged_at {
             m
@@ -333,6 +348,7 @@ fn main() -> Result<()> {
         let mut last_test = None;
         let mut merge_at = None;
         let mut appveyor_build = None;
+        let mut travis_build: Option<TravisBuild> = None;
         for c in &comments {
             let prev = pr_state;
             if c.body.contains("bors r+") || c.body.contains("bors r=") {
@@ -359,6 +375,16 @@ fn main() -> Result<()> {
                     }));
                 } else {
                     panic!("could not find AppVeyor build in {:?}", c.body);
+                }
+                if let Some(travis) = travis_re.captures(&c.body) {
+                    let id = travis[1].parse::<u64>().unwrap_or_else(|e| {
+                        panic!("could not parse build ID from {:?}: {:?}", &travis[1], e);
+                    });
+                    let build: TravisBuild =
+                        gh.request(&format!("https://api.travis-ci.org/build/{}", id))?;
+                    travis_build = Some(build);
+                } else {
+                    panic!("could not find Travis build in {:?}", c.body);
                 }
                 merge_at = Some(c.created_at);
             }
@@ -393,6 +419,14 @@ fn main() -> Result<()> {
                 }
                 None
             };
+            let travis_build: Option<&TravisBuild> = if let Some(tb) = &travis_build {
+                Some(tb)
+            } else {
+                if merge_at.is_some() {
+                    panic!("Travis build unknown for {}, merged at {:?}", pr.number, merge_at);
+                }
+                None
+            };
             let pr_date = pr.created_at;
             let approve_to_merge = merged_at - approval;
             let merge_time = last_test.map(|t| merge_at.unwrap() - t);
@@ -401,6 +435,7 @@ fn main() -> Result<()> {
                 merge_delay: approve_to_merge.num_hours(),
                 merge_time,
                 appveyor_time: appveyor_build.map(|b| b.finished - b.started),
+                travis_time: travis_build.map(|b| b.finished_at - b.started_at),
             });
         } else {
             skipped += 1;
@@ -446,20 +481,48 @@ fn main() -> Result<()> {
     fs::write("merge_delay.csv", f.as_bytes())?;
 
     let mut f = String::new();
+    let mut merge_time_by_date = BTreeMap::new();
     for datum in &data {
-        if let Some(merge_time) = datum.merge_time {
-            writeln!(
-                f,
-                r#"{},{},{}"#,
-                datum.date.format("%Y-%m-%d"),
-                merge_time.num_minutes(),
-                datum.appveyor_time.unwrap().num_minutes(),
-            )?;
+        let week = datum.date.iso_week().week();
+        let date = NaiveDate::from_isoywd_opt(datum.date.year(), week, chrono::Weekday::Wed)
+            .unwrap_or_else(|| {
+                panic!("could not handle week {}", week);
+            });
+        merge_time_by_date.entry(date).or_insert_with(Vec::new).push(datum);
+    }
+    for (date, datums) in &merge_time_by_date {
+        if let Some(s) = write_merge_time(*date, &datums[..]) {
+            writeln!(f, "{}", s)?;
         }
     }
     fs::write("merge_time.csv", f.as_bytes())?;
 
     Ok(())
+}
+
+fn write_merge_time(date: NaiveDate, datums: &[&Datum]) -> Option<String> {
+    let percentile = 95;
+    let overall = sort_percentile(
+        datums.iter().flat_map(|d| d.merge_time).map(|d| d.num_minutes()), percentile)?;
+    let travis = sort_percentile(
+        datums.iter().flat_map(|d| d.travis_time).map(|d| d.num_minutes()), percentile)?;
+    let appveyor = sort_percentile(
+        datums.iter().flat_map(|d| d.appveyor_time).map(|d| d.num_minutes()), percentile)?;
+    Some(format!(
+        r#"{},{},{},{}"#,
+        date.format("%Y-%m-%d"),
+        overall,
+        travis,
+        appveyor,
+    ))
+}
+
+fn sort_percentile<T: Ord>(v: impl Iterator<Item=T>, p: usize) -> Option<T> {
+    let mut v = v.collect::<Vec<_>>();
+    if v.is_empty() { return None }
+    v.sort_unstable();
+    let idx = v.len() as f64 * p as f64 / 100.0;
+    Some(v.remove(idx.floor() as usize))
 }
 
 fn percentile<T>(v: &[T], p: usize) -> &T {
