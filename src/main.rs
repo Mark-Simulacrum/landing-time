@@ -1,13 +1,13 @@
+use chrono::{DateTime, Datelike, NaiveDate};
 use reqwest::Client;
-use std::fmt::Write;
+use serde_derive::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt;
-use std::fs;
-use serde_derive::{Serialize, Deserialize};
-use std::path::{Path, PathBuf};
 use std::error::Error;
+use std::fmt;
+use std::fmt::Write;
+use std::fs;
 use std::marker::PhantomData;
-use chrono::{Datelike, NaiveDate, DateTime};
+use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -58,8 +58,10 @@ impl Request<()> {
         client: &Client,
         cached: Option<T>,
     ) -> Result<Request<T>> {
-        let mut query = client.get(&self.url)
-            .basic_auth("Mark-Simulacrum", Some(dotenv::var("GH_OAUTH_TOKEN").unwrap()));
+        let mut query = client.get(&self.url).basic_auth(
+            "Mark-Simulacrum",
+            Some(dotenv::var("GH_OAUTH_TOKEN").unwrap()),
+        );
         query = query.header(reqwest::header::USER_AGENT, "Mark-Simulacrum");
         if let Some(etag) = &self.etag {
             if etag.starts_with("W/") {
@@ -76,11 +78,16 @@ impl Request<()> {
             let etag = resp.headers().get("ETag");
             let last_modified = resp.headers().get("Last-Modified");
             let link = resp.headers().get("Link");
-            eprintln!("fetching {}, modified, {:?} != {:?}", self.url, self.etag, etag);
+            eprintln!(
+                "fetching {}, modified, {:?} != {:?}",
+                self.url, self.etag, etag
+            );
             let r = Request {
                 url: self.url.clone(),
                 etag: etag.and_then(|v| v.to_str().ok()).map(|v| v.to_string()),
-                last_modified: last_modified.and_then(|v| v.to_str().ok()).map(|v| v.to_string()),
+                last_modified: last_modified
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_string()),
                 link: link.and_then(|v| v.to_str().ok()).map(|v| v.to_string()),
                 data: resp.text()?,
                 _data: PhantomData,
@@ -103,16 +110,19 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Request<T> {
     fn split(self) -> (Request<()>, T) {
         let data = self.data;
         let url = self.url.clone();
-        (Request {
-            url: self.url,
-            etag: self.etag,
-            last_modified: self.last_modified,
-            link: self.link,
-            data: String::new(),
-            _data: PhantomData,
-        }, serde_json::from_str(&data).unwrap_or_else(|e| {
-            panic!("deserialize {:?} (:?) failed: {:?} {:?}", url, data, e);
-        }))
+        (
+            Request {
+                url: self.url,
+                etag: self.etag,
+                last_modified: self.last_modified,
+                link: self.link,
+                data: String::new(),
+                _data: PhantomData,
+            },
+            serde_json::from_str(&data).unwrap_or_else(|e| {
+                panic!("deserialize {:?} (:?) failed: {:?} {:?}", url, data, e);
+            }),
+        )
     }
 
     fn from_url(client: &Client, url: String, cache: &Path) -> Result<Request<T>> {
@@ -144,12 +154,21 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Request<T> {
     fn next(&self, gh: &Github) -> Result<Option<Request<T>>> {
         if let Some(link) = &self.link {
             let links = link.parse::<hyperx::header::Link>().unwrap();
-            let next = links.values()
-                .iter().find(|v| {
-                    v.rel().unwrap_or(&[]).contains(&hyperx::header::RelationType::Next)
-                });
-            let next = if let Some(n) = next { n } else { return Ok(None); };
-            Ok(Some(Request::from_url(gh.client, next.link().to_owned(), &gh.dir)?))
+            let next = links.values().iter().find(|v| {
+                v.rel()
+                    .unwrap_or(&[])
+                    .contains(&hyperx::header::RelationType::Next)
+            });
+            let next = if let Some(n) = next {
+                n
+            } else {
+                return Ok(None);
+            };
+            Ok(Some(Request::from_url(
+                gh.client,
+                next.link().to_owned(),
+                &gh.dir,
+            )?))
         } else {
             Ok(None)
         }
@@ -157,7 +176,10 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Request<T> {
 
     fn data(&self) -> T {
         serde_json::from_str(&self.data).unwrap_or_else(|e| {
-            panic!("deserialize {:?} (:?) failed: {:?} {:?}", self.url, self.data, e);
+            panic!(
+                "deserialize {:?} (:?) failed: {:?} {:?}",
+                self.url, self.data, e
+            );
         })
     }
 }
@@ -175,7 +197,10 @@ impl<'a> Github<'a> {
         return Ok(Request::from_url(&self.client, url.to_string(), &self.dir)?.data());
     }
 
-    fn request_seq<T: serde::Serialize + serde::de::DeserializeOwned>(&self, url: &str) -> Result<Vec<T>> {
+    fn request_seq<T: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<Vec<T>> {
         let req = Request::<Vec<T>>::from_url(&self.client, url.to_string(), &self.dir)?;
         let mut data: Vec<T> = Vec::new();
         let mut next_request = req.next(self)?;
@@ -219,7 +244,8 @@ struct Datum {
 fn main() -> Result<()> {
     let client = Client::new();
     let gh = Github::new(&client);
-    let prs: Vec<PullRequest> = gh.request_seq("https://api.github.com/repos/rust-lang/rust/pulls?state=all&per_page=100")?;
+    let prs: Vec<PullRequest> =
+        gh.request_seq("https://api.github.com/repos/rust-lang/rust/pulls?state=all&per_page=100")?;
 
     eprintln!("fetched {} PRs", prs.len());
 
@@ -228,7 +254,11 @@ fn main() -> Result<()> {
     let mut data = Vec::new();
     for pr in &prs[0..6000] {
         let comments: Vec<Comment> = gh.request_seq(&pr.comments_url)?;
-        let merged_at = if let Some(m) = pr.merged_at { m } else { continue };
+        let merged_at = if let Some(m) = pr.merged_at {
+            m
+        } else {
+            continue;
+        };
         let mut pr_state = State::Proposed;
         let mut final_approval = None;
         for c in &comments {
@@ -241,13 +271,14 @@ fn main() -> Result<()> {
                 pr_state = State::Denied;
             }
             match (prev, pr_state) {
-                (State::Proposed, State::Approved) |
-                (State::Denied, State::Approved) => {
+                (State::Proposed, State::Approved) | (State::Denied, State::Approved) => {
                     final_approval = Some(c.created_at);
                 }
                 // Can merge conflict before first approval
-                (State::MergeConflict, State::Approved) => if final_approval.is_none() {
-                    final_approval = Some(c.created_at);
+                (State::MergeConflict, State::Approved) => {
+                    if final_approval.is_none() {
+                        final_approval = Some(c.created_at);
+                    }
                 }
                 // Warn about cases where we're approving but haven't yet
                 // recorded a final approval
@@ -272,7 +303,10 @@ fn main() -> Result<()> {
     }
 
     points.sort_unstable();
-    eprintln!("99th percentile: {}", *percentile(&points, 99) as f64 / 24.0);
+    eprintln!(
+        "99th percentile: {}",
+        *percentile(&points, 99) as f64 / 24.0
+    );
 
     eprintln!("skipped {} PRs merged w/o approval", skipped);
 
@@ -282,13 +316,10 @@ fn main() -> Result<()> {
         let week = datum.date.iso_week().week();
         // 2-week intervals
         let week = week + week % 2;
-        let date = NaiveDate::from_isoywd_opt(
-            datum.date.year(),
-            week,
-            chrono::Weekday::Sat,
-        ).unwrap_or_else(|| {
-            panic!("could not handle week {}", week);
-        });
+        let date = NaiveDate::from_isoywd_opt(datum.date.year(), week, chrono::Weekday::Sat)
+            .unwrap_or_else(|| {
+                panic!("could not handle week {}", week);
+            });
         by_date.entry(date).or_insert_with(Vec::new).push(datum);
     }
     for datums in by_date.values_mut() {
@@ -312,7 +343,6 @@ fn main() -> Result<()> {
             datums.iter().map(|d| d.merge_time).sum::<i64>() as usize / datums.len(),
             datums.iter().map(|d| d.merge_time).max().unwrap(),
         )?;
-
     }
     fs::write("out.csv", f.as_bytes())?;
 
