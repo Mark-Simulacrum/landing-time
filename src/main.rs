@@ -1,12 +1,13 @@
 use reqwest::Client;
 use std::fmt::Write;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use serde_derive::{Serialize, Deserialize};
 use std::path::{Path, PathBuf};
 use std::error::Error;
 use std::marker::PhantomData;
-use chrono::DateTime;
+use chrono::{Datelike, NaiveDate, DateTime};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -72,10 +73,10 @@ impl Request<()> {
         }
         let mut resp = query.send()?;
         if resp.status() != reqwest::StatusCode::NOT_MODIFIED {
-            eprintln!("fetching {}, modified", self.url);
             let etag = resp.headers().get("ETag");
             let last_modified = resp.headers().get("Last-Modified");
             let link = resp.headers().get("Link");
+            eprintln!("fetching {}, modified, {:?} != {:?}", self.url, self.etag, etag);
             let r = Request {
                 url: self.url.clone(),
                 etag: etag.and_then(|v| v.to_str().ok()).map(|v| v.to_string()),
@@ -196,6 +197,25 @@ impl fmt::Display for LargeDuration {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+enum State {
+    /// beginning
+    Proposed,
+    /// r+
+    Approved,
+    /// "resolve the merge conflicts"
+    MergeConflict,
+    /// r-
+    Denied,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+struct Datum {
+    date: chrono::NaiveDate,
+    // in hours
+    merge_time: i64,
+}
+
 fn main() -> Result<()> {
     let client = Client::new();
     let gh = Github::new(&client);
@@ -203,28 +223,49 @@ fn main() -> Result<()> {
 
     eprintln!("fetched {} PRs", prs.len());
 
-    let mut f = String::new();
-    //let mut last = Vec::new();
     let mut skipped = 0;
     let mut points = Vec::new();
+    let mut data = Vec::new();
     for pr in &prs[0..6000] {
         let comments: Vec<Comment> = gh.request_seq(&pr.comments_url)?;
         let merged_at = if let Some(m) = pr.merged_at { m } else { continue };
-        if let Some(approval) = comments.iter().rfind(|c| {
-            c.body.contains("bors r+") || c.body.contains("bors r=")
-        }) {
+        let mut pr_state = State::Proposed;
+        let mut final_approval = None;
+        for c in &comments {
+            let prev = pr_state;
+            if c.body.contains("bors r+") || c.body.contains("bors r=") {
+                pr_state = State::Approved;
+            } else if c.body.contains("resolve the merge conflicts") && c.user.login == "bors" {
+                pr_state = State::MergeConflict;
+            } else if c.body.contains("bors r-") {
+                pr_state = State::Denied;
+            }
+            match (prev, pr_state) {
+                (State::Proposed, State::Approved) |
+                (State::Denied, State::Approved) => {
+                    final_approval = Some(c.created_at);
+                }
+                // Can merge conflict before first approval
+                (State::MergeConflict, State::Approved) => if final_approval.is_none() {
+                    final_approval = Some(c.created_at);
+                }
+                // Warn about cases where we're approving but haven't yet
+                // recorded a final approval
+                (_, State::Approved) if final_approval.is_none() => {
+                    eprintln!("{:?} => approval in {:?}", prev, pr.number);
+                }
+                _ => {}
+            }
+        }
+        if let Some(approval) = final_approval {
             let pr_date = pr.created_at;
-            //let create_to_approve = approval.created_at - pr.created_at;
-            let approve_to_merge = merged_at - approval.created_at;
-            let date = pr_date.date().naive_local().format("%Y-%m-%d").to_string();
-            //last.push(approve_to_merge.num_hours());
-            //if last.len() > 10 {
-            //    last.remove(0);
-            //}
-            //let avg = last.iter().sum::<i64>() as usize / last.len();
+            let approve_to_merge = merged_at - approval;
             let point = approve_to_merge.num_hours();
             points.push(point);
-            writeln!(f, r#"{},{}"#, date, point)?;
+            data.push(Datum {
+                date: pr_date.date().naive_local(),
+                merge_time: approve_to_merge.num_hours(),
+            });
         } else {
             skipped += 1;
         }
@@ -234,12 +275,51 @@ fn main() -> Result<()> {
     eprintln!("99th percentile: {}", *percentile(&points, 99) as f64 / 24.0);
 
     eprintln!("skipped {} PRs merged w/o approval", skipped);
+
+    let mut f = String::new();
+    let mut by_date = BTreeMap::new();
+    for datum in &data {
+        let week = datum.date.iso_week().week();
+        // 2-week intervals
+        let week = week + week % 2;
+        let date = NaiveDate::from_isoywd_opt(
+            datum.date.year(),
+            week,
+            chrono::Weekday::Sat,
+        ).unwrap_or_else(|| {
+            panic!("could not handle week {}", week);
+        });
+        by_date.entry(date).or_insert_with(Vec::new).push(datum);
+    }
+    for datums in by_date.values_mut() {
+        datums.sort_unstable_by_key(|d| d.merge_time);
+    }
+    for (date, datums) in &by_date {
+        let p85 = percentile(&datums, 85);
+        let p90 = percentile(&datums, 90);
+        let p95 = percentile(&datums, 95);
+        let p98 = percentile(&datums, 98);
+        let p99 = percentile(&datums, 99);
+        writeln!(
+            f,
+            r#"{},{},{},{},{},{},{},{}"#,
+            date.format("%Y-%m-%d"),
+            p85.merge_time,
+            p90.merge_time,
+            p95.merge_time,
+            p98.merge_time,
+            p99.merge_time,
+            datums.iter().map(|d| d.merge_time).sum::<i64>() as usize / datums.len(),
+            datums.iter().map(|d| d.merge_time).max().unwrap(),
+        )?;
+
+    }
     fs::write("out.csv", f.as_bytes())?;
 
     Ok(())
 }
 
 fn percentile<T>(v: &[T], p: usize) -> &T {
-    let idx = v.len() * p / 100;
-    &v[idx]
+    let idx = v.len() as f64 * p as f64 / 100.0;
+    &v[idx.floor() as usize]
 }
