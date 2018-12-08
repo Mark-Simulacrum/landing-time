@@ -1,7 +1,7 @@
 use chrono::{DateTime, Datelike, NaiveDate};
 use reqwest::Client;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{HashMap, BTreeMap};
 use std::error::Error;
 use std::fmt;
 use std::fmt::Write;
@@ -58,10 +58,19 @@ impl Request<()> {
         client: &Client,
         cached: Option<T>,
     ) -> Result<Request<T>> {
-        let mut query = client.get(&self.url).basic_auth(
-            "Mark-Simulacrum",
-            Some(dotenv::var("GH_OAUTH_TOKEN").unwrap()),
-        );
+        let mut query = if self.url.contains("api.github.com") {
+            client.get(&self.url).basic_auth(
+                "Mark-Simulacrum",
+                Some(dotenv::var("GH_OAUTH_TOKEN").unwrap()),
+            )
+        } else if self.url.contains("ci.appveyor.com/api") {
+            client.get(&self.url).header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", dotenv::var("APPVEYOR_OAUTH_TOKEN").unwrap()),
+            )
+        } else {
+            panic!("unknown API provider: {}", self.url);
+        };
         query = query.header(reqwest::header::USER_AGENT, "Mark-Simulacrum");
         if let Some(etag) = &self.etag {
             if etag.starts_with("W/") {
@@ -73,6 +82,7 @@ impl Request<()> {
         if let Some(since) = &self.last_modified {
             query = query.header("If-Modified-Since", since.as_str());
         }
+        query = query.header("Content-Type", "application/json");
         let mut resp = query.send()?;
         if resp.status() != reqwest::StatusCode::NOT_MODIFIED {
             let etag = resp.headers().get("ETag");
@@ -94,6 +104,7 @@ impl Request<()> {
             };
             return Ok(r);
         }
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
         Ok(Request {
             url: self.url.clone(),
@@ -120,7 +131,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Request<T> {
                 _data: PhantomData,
             },
             serde_json::from_str(&data).unwrap_or_else(|e| {
-                panic!("deserialize {:?} (:?) failed: {:?} {:?}", url, data, e);
+                panic!("deserialize {:?} ({:?}) failed: {:?}", url, data, e);
             }),
         )
     }
@@ -176,10 +187,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Request<T> {
 
     fn data(&self) -> T {
         serde_json::from_str(&self.data).unwrap_or_else(|e| {
-            panic!(
-                "deserialize {:?} (:?) failed: {:?} {:?}",
-                self.url, self.data, e
-            );
+            panic!("deserialize {:?} ({:?}) failed: {:?}", self.url, self.data, e);
         })
     }
 }
@@ -234,6 +242,61 @@ enum State {
     Denied,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct AppVeyorJob {
+    name: String,
+    started: Option<DateTime<chrono::FixedOffset>>,
+    finished: Option<DateTime<chrono::FixedOffset>>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct AppVeyorBuild {
+    #[serde(rename = "buildId")]
+    id: u64,
+    jobs: Vec<AppVeyorJob>,
+    version: String,
+    started: DateTime<chrono::FixedOffset>,
+    finished: DateTime<chrono::FixedOffset>,
+}
+
+fn fetch_appveyor(client: &CacheClient) -> Result<(HashMap<u64, AppVeyorBuild>, HashMap<String, u64>)> {
+    let mut map = HashMap::new();
+    let mut id_map = HashMap::new();
+
+    let url = "https://ci.appveyor.com/api/projects/rust-lang/rust/history?recordsNumber=100";
+
+    let mut last_build_id = None;
+    'outer: loop {
+        let reply: serde_json::Value = match last_build_id {
+            Some(b) => client.request(&format!("{}&startBuildId={}", url, b))?,
+            None => client.request(url)?,
+        };
+
+        if reply["builds"].as_array().unwrap().is_empty() {
+            break;
+        }
+
+        for build in reply["builds"].as_array().unwrap() {
+            // Skip not started and/or not finished builds
+            if !(build["started"].is_string() && build["finished"].is_string()) {
+                continue;
+            }
+            let version = build["version"].as_str().unwrap();
+
+            let b: serde_json::Value = client.request(
+                &format!("https://ci.appveyor.com/api/projects/rust-lang/rust/build/{}", version))?;
+            let b: AppVeyorBuild = serde_json::from_value(b["build"].clone()).unwrap_or_else(|e| {
+                panic!("could not deserialize AppVeyorBuild from {:?}: {:?}", b["build"], e);
+            });
+            last_build_id = Some(b.id);
+            id_map.insert(version.to_string(), b.id);
+            map.insert(b.id, b);
+        }
+    }
+
+    Ok((map, id_map))
+}
+
 #[derive(Debug, Copy, Clone)]
 struct Datum {
     date: chrono::NaiveDate,
@@ -242,15 +305,19 @@ struct Datum {
     // in hours
     // this might be None if the PR was merged via rollup
     merge_time: Option<chrono::Duration>,
+    appveyor_time: Option<chrono::Duration>,
 }
 
 fn main() -> Result<()> {
     let client = Client::new();
     let gh = CacheClient::new(&client);
+    let appveyor_re = regex::Regex::new(r#"\[status-appveyor\]\(.*?project/rust-lang/rust/builds?/(.+?)\)"#)?;
     let prs: Vec<PullRequest> =
         gh.request_seq("https://api.github.com/repos/rust-lang/rust/pulls?state=all&per_page=100")?;
 
     eprintln!("fetched {} PRs", prs.len());
+
+    let appveyor_builds = fetch_appveyor(&gh)?;
 
     let mut skipped = 0;
     let mut data = Vec::new();
@@ -265,6 +332,7 @@ fn main() -> Result<()> {
         let mut final_approval = None;
         let mut last_test = None;
         let mut merge_at = None;
+        let mut appveyor_build = None;
         for c in &comments {
             let prev = pr_state;
             if c.body.contains("bors r+") || c.body.contains("bors r=") {
@@ -278,7 +346,20 @@ fn main() -> Result<()> {
                 last_test = Some(c.created_at);
             }
             if c.user.login == "bors" && c.body.contains("Test successful") &&
-                c.body.contains("Pushing") && c.body.contains("to master") {
+                c.body.contains("Pushing") {
+                if let Some(appveyor) = appveyor_re.captures(&c.body) {
+                    appveyor_build = Some(appveyor[1].parse::<u64>().unwrap_or_else(|e| {
+                        if appveyor[1].starts_with("1.0.") {
+                            *appveyor_builds.1.get(&appveyor[1]).unwrap_or_else(|| {
+                                panic!("could not retrieve build ID for {}", &appveyor[1])
+                            })
+                        } else {
+                            panic!("could not parse build ID from {:?}: {:?}", &appveyor[1], e);
+                        }
+                    }));
+                } else {
+                    panic!("could not find AppVeyor build in {:?}", c.body);
+                }
                 merge_at = Some(c.created_at);
             }
             match (prev, pr_state) {
@@ -304,6 +385,14 @@ fn main() -> Result<()> {
             merge_at = None;
         }
         if let Some(approval) = final_approval {
+            let appveyor_build = if let Some(ab) = appveyor_build {
+                Some(&appveyor_builds.0[&ab])
+            } else {
+                if merge_at.is_some() {
+                    panic!("AppVeyor build ID unknown for {}, merged at {:?}", pr.number, merge_at);
+                }
+                None
+            };
             let pr_date = pr.created_at;
             let approve_to_merge = merged_at - approval;
             let merge_time = last_test.map(|t| merge_at.unwrap() - t);
@@ -311,6 +400,7 @@ fn main() -> Result<()> {
                 date: pr_date.date().naive_local(),
                 merge_delay: approve_to_merge.num_hours(),
                 merge_time,
+                appveyor_time: appveyor_build.map(|b| b.finished - b.started),
             });
         } else {
             skipped += 1;
@@ -360,9 +450,10 @@ fn main() -> Result<()> {
         if let Some(merge_time) = datum.merge_time {
             writeln!(
                 f,
-                r#"{},{}"#,
+                r#"{},{},{}"#,
                 datum.date.format("%Y-%m-%d"),
                 merge_time.num_minutes(),
+                datum.appveyor_time.unwrap().num_minutes(),
             )?;
         }
     }

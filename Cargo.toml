@@ -13,6 +13,7 @@ dotenv = "0.13.0"
 crypto-hash = "0.3.1"
 hyperx = "0.13.1"
 chrono = { version = "0.4.6", features = ["serde"] }
+regex = "1.1.0"
 
 [profile.release]
 debug = true
