@@ -32,7 +32,7 @@ struct Comment {
     body: String,
 }
 
-struct Github<'a> {
+struct CacheClient<'a> {
     client: &'a Client,
     dir: PathBuf,
 }
@@ -151,7 +151,7 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Request<T> {
         Ok(r)
     }
 
-    fn next(&self, gh: &Github) -> Result<Option<Request<T>>> {
+    fn next(&self, gh: &CacheClient) -> Result<Option<Request<T>>> {
         if let Some(link) = &self.link {
             let links = link.parse::<hyperx::header::Link>().unwrap();
             let next = links.values().iter().find(|v| {
@@ -184,9 +184,9 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> Request<T> {
     }
 }
 
-impl<'a> Github<'a> {
+impl<'a> CacheClient<'a> {
     fn new(c: &'a Client) -> Self {
-        Github {
+        CacheClient {
             client: c,
             dir: PathBuf::from("cache"),
         }
@@ -234,23 +234,25 @@ enum State {
     Denied,
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct Datum {
     date: chrono::NaiveDate,
     // in hours
-    merge_time: i64,
+    merge_delay: i64,
+    // in hours
+    // this might be None if the PR was merged via rollup
+    merge_time: Option<chrono::Duration>,
 }
 
 fn main() -> Result<()> {
     let client = Client::new();
-    let gh = Github::new(&client);
+    let gh = CacheClient::new(&client);
     let prs: Vec<PullRequest> =
         gh.request_seq("https://api.github.com/repos/rust-lang/rust/pulls?state=all&per_page=100")?;
 
     eprintln!("fetched {} PRs", prs.len());
 
     let mut skipped = 0;
-    let mut points = Vec::new();
     let mut data = Vec::new();
     for pr in &prs[0..6000] {
         let comments: Vec<Comment> = gh.request_seq(&pr.comments_url)?;
@@ -261,6 +263,8 @@ fn main() -> Result<()> {
         };
         let mut pr_state = State::Proposed;
         let mut final_approval = None;
+        let mut last_test = None;
+        let mut merge_at = None;
         for c in &comments {
             let prev = pr_state;
             if c.body.contains("bors r+") || c.body.contains("bors r=") {
@@ -269,6 +273,13 @@ fn main() -> Result<()> {
                 pr_state = State::MergeConflict;
             } else if c.body.contains("bors r-") {
                 pr_state = State::Denied;
+            }
+            if c.body.contains("Testing commit") && c.user.login == "bors" {
+                last_test = Some(c.created_at);
+            }
+            if c.user.login == "bors" && c.body.contains("Test successful") &&
+                c.body.contains("Pushing") && c.body.contains("to master") {
+                merge_at = Some(c.created_at);
             }
             match (prev, pr_state) {
                 (State::Proposed, State::Approved) | (State::Denied, State::Approved) => {
@@ -288,30 +299,28 @@ fn main() -> Result<()> {
                 _ => {}
             }
         }
+        if last_test.is_none() || merge_at.is_none() {
+            last_test = None;
+            merge_at = None;
+        }
         if let Some(approval) = final_approval {
             let pr_date = pr.created_at;
             let approve_to_merge = merged_at - approval;
-            let point = approve_to_merge.num_hours();
-            points.push(point);
+            let merge_time = last_test.map(|t| merge_at.unwrap() - t);
             data.push(Datum {
                 date: pr_date.date().naive_local(),
-                merge_time: approve_to_merge.num_hours(),
+                merge_delay: approve_to_merge.num_hours(),
+                merge_time,
             });
         } else {
             skipped += 1;
         }
     }
 
-    points.sort_unstable();
-    eprintln!(
-        "99th percentile: {}",
-        *percentile(&points, 99) as f64 / 24.0
-    );
-
     eprintln!("skipped {} PRs merged w/o approval", skipped);
 
     let mut f = String::new();
-    let mut by_date = BTreeMap::new();
+    let mut delay_by_date = BTreeMap::new();
     for datum in &data {
         let week = datum.date.iso_week().week();
         // 2-week intervals
@@ -320,12 +329,12 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| {
                 panic!("could not handle week {}", week);
             });
-        by_date.entry(date).or_insert_with(Vec::new).push(datum);
+        delay_by_date.entry(date).or_insert_with(Vec::new).push(datum.merge_delay);
     }
-    for datums in by_date.values_mut() {
-        datums.sort_unstable_by_key(|d| d.merge_time);
+    for datums in delay_by_date.values_mut() {
+        datums.sort_unstable();
     }
-    for (date, datums) in &by_date {
+    for (date, datums) in &delay_by_date {
         let p85 = percentile(&datums, 85);
         let p90 = percentile(&datums, 90);
         let p95 = percentile(&datums, 95);
@@ -335,16 +344,29 @@ fn main() -> Result<()> {
             f,
             r#"{},{},{},{},{},{},{},{}"#,
             date.format("%Y-%m-%d"),
-            p85.merge_time,
-            p90.merge_time,
-            p95.merge_time,
-            p98.merge_time,
-            p99.merge_time,
-            datums.iter().map(|d| d.merge_time).sum::<i64>() as usize / datums.len(),
-            datums.iter().map(|d| d.merge_time).max().unwrap(),
+            p85,
+            p90,
+            p95,
+            p98,
+            p99,
+            datums.iter().sum::<i64>() as usize / datums.len(),
+            datums.iter().max().unwrap(),
         )?;
     }
-    fs::write("out.csv", f.as_bytes())?;
+    fs::write("merge_delay.csv", f.as_bytes())?;
+
+    let mut f = String::new();
+    for datum in &data {
+        if let Some(merge_time) = datum.merge_time {
+            writeln!(
+                f,
+                r#"{},{}"#,
+                datum.date.format("%Y-%m-%d"),
+                merge_time.num_minutes(),
+            )?;
+        }
+    }
+    fs::write("merge_time.csv", f.as_bytes())?;
 
     Ok(())
 }
